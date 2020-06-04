@@ -69,6 +69,10 @@ endif()
 if(WITH_GPU)
     add_definitions(-DPADDLE_WITH_CUDA)
     add_definitions(-DEIGEN_USE_GPU)
+    # The compiler fully support const expressions since c++14,
+    # but Eigen use some const expressions such as std::max and std::min, which are not supported in c++11
+    # use following definition to set EIGEN_HAS_CONSTEXPR=0 to avoid compilation error in c++11
+    add_definitions(-DEIGEN_MAX_CPP_VER=11)
 
     FIND_PACKAGE(CUDA REQUIRED)
 
@@ -150,3 +154,7 @@ endif(WITH_BRPC_RDMA)
 if(ON_INFER)
     add_definitions(-DPADDLE_ON_INFERENCE)
 endif(ON_INFER)
+
+if(WITH_CRYPTO)
+    add_definitions(-DPADDLE_WITH_CRYPTO)
+endif(WITH_CRYPTO)

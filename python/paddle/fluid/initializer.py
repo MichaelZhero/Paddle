@@ -18,9 +18,9 @@ from . import framework
 from . import core
 from .framework import in_dygraph_mode
 import numpy as np
-from .wrapped_decorator import signature_safe_contextmanager
 from .core import VarDesc
 from . import unique_name
+from .data_feeder import check_variable_and_dtype, check_type, check_dtype
 
 __all__ = [
     'Constant', 'Uniform', 'Normal', 'TruncatedNormal', 'Xavier', 'Bilinear',
@@ -216,8 +216,10 @@ class UniformInitializer(Initializer):
         Returns:
             the initialization op
         """
-        assert isinstance(var, framework.Variable)
         assert isinstance(block, framework.Block)
+        check_variable_and_dtype(var, "Out", ["float16", "float32", "float64"],
+                                 "uniform_random")
+
         # Initialization Ops should be prepended and not appended
         if self._seed == 0:
             self._seed = block.program.random_seed
@@ -303,8 +305,10 @@ class NormalInitializer(Initializer):
         Returns:
             the initialization op
         """
-        assert isinstance(var, framework.Variable)
         assert isinstance(block, framework.Block)
+
+        check_variable_and_dtype(var, "Out", ["float16", "float32", "float64"],
+                                 "guassian_random")
         # Initialization Ops should be prepended and not appended
         if self._seed == 0:
             self._seed = block.program.random_seed
@@ -494,8 +498,10 @@ class XavierInitializer(Initializer):
         Returns:
             the initialization op
         """
-        assert isinstance(var, framework.Variable)
         assert isinstance(block, framework.Block)
+        check_variable_and_dtype(var, "Out", ["float16", "float32", "float64"],
+                                 "xavier_init")
+
         f_in, f_out = self._compute_fans(var)
 
         # If fan_in and fan_out are passed, use them
@@ -777,7 +783,7 @@ class BilinearInitializer(Initializer):
         weight = np.reshape(weight, shape)
 
         # to be compatible of fp16 initalizers
-        if var.dtype == VarDesc.VarType.FP16:
+        if var.dtype == VarDesc.VarType.FP16 or var.dtype == VarDesc.VarType.FP64:
             out_dtype = VarDesc.VarType.FP32
             out_var = block.create_var(
                 name=unique_name.generate(".".join(
@@ -794,7 +800,8 @@ class BilinearInitializer(Initializer):
             value_name = "fp32_values"
             values = [float(v) for v in weight.flat]
         else:
-            raise ValueError("Unsupported dtype %s", input.dtype)
+            raise TypeError("Unsupported dtype %s", var.dtype)
+
         if np.prod(shape) > 1024 * 1024:
             raise ValueError("The size of input is too big. ")
         op = block.append_op(
@@ -806,7 +813,7 @@ class BilinearInitializer(Initializer):
                 value_name: values
             })
 
-        if var.dtype == VarDesc.VarType.FP16:
+        if var.dtype == VarDesc.VarType.FP16 or var.dtype == VarDesc.VarType.FP64:
             block.append_op(
                 type="cast",
                 inputs={"X": out_var},

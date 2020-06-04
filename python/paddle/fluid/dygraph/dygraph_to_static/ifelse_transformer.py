@@ -22,15 +22,18 @@ from collections import defaultdict
 # as produced by ast.parse from the standard ast module.
 # See details in https://github.com/serge-sans-paille/gast/
 import gast
-import six
 from paddle.fluid import unique_name
 
-from paddle.fluid.dygraph.dygraph_to_static.utils import is_paddle_api
+from paddle.fluid.dygraph.dygraph_to_static.utils import compare_with_none
+from paddle.fluid.dygraph.dygraph_to_static.utils import is_candidate_node
 from paddle.fluid.dygraph.dygraph_to_static.utils import ast_to_source_code
 from paddle.fluid.dygraph.dygraph_to_static.utils import create_funcDef_node
 from paddle.fluid.dygraph.dygraph_to_static.utils import create_assign_node
+from paddle.fluid.dygraph.dygraph_to_static.utils import IsControlFlowVisitor
 from paddle.fluid.dygraph.dygraph_to_static.static_analysis import StaticAnalysisVisitor
-from paddle.fluid.dygraph.dygraph_to_static.static_analysis import AstNodeWrapper, NodeVarType
+from paddle.fluid.dygraph.dygraph_to_static.static_analysis import AstNodeWrapper
+from paddle.fluid.dygraph.dygraph_to_static.static_analysis import NodeVarType
+from paddle.fluid.dygraph.dygraph_to_static.variable_trans_func import create_static_variable_gast_node
 
 TRUE_FUNC_PREFIX = 'true_fn'
 FALSE_FUNC_PREFIX = 'false_fn'
@@ -52,31 +55,28 @@ class IfElseTransformer(gast.NodeTransformer):
             wrapper_root)
         self.root = wrapper_root.node
         self.static_analysis_visitor = StaticAnalysisVisitor(self.root)
-        self.new_func_nodes = {}
 
     def transform(self):
         """
         Main function to transform AST.
         """
         self.visit(self.root)
-        self.after_visit(self.root)
 
     def visit_If(self, node):
-        assert isinstance(node, gast.If)
         if_condition_visitor = IfConditionVisitor(node.test,
                                                   self.static_analysis_visitor)
         need_transform = if_condition_visitor.is_control_flow()
         self.generic_visit(node)
         if need_transform:
             pred_node, new_assign_nodes = if_condition_visitor.transform()
-            true_func_node, false_func_node, return_name_ids = transform_if_else(
+            new_vars_stmts, true_func_node, false_func_node, return_name_ids = transform_if_else(
                 node, self.root)
             # create layers.cond
-            new_node = create_cond_node(return_name_ids, pred_node,
-                                        true_func_node, false_func_node)
-            self.new_func_nodes[new_node] = [true_func_node, false_func_node
-                                             ] + new_assign_nodes
-            return new_node
+            cond_node = create_cond_node(return_name_ids, pred_node,
+                                         true_func_node, false_func_node)
+
+            return new_vars_stmts + [true_func_node, false_func_node
+                                     ] + new_assign_nodes + [cond_node]
         else:
             return node
 
@@ -86,188 +86,117 @@ class IfElseTransformer(gast.NodeTransformer):
             attribute = node.func
             if attribute.attr == 'numpy':
                 node = attribute.value
-        return node
-
-    def after_visit(self, node):
-        """
-        This function will add some postprocessing operations with node.
-        It can be used to add the created `true_fn/false_fn` in front of
-        the node.body before they are called in cond layer.
-        """
-        self._insert_func_nodes(node)
-
-    def _insert_func_nodes(self, node):
-        """
-        Defined `true_func` and `false_func` will be inserted in front of corresponding
-        `layers.cond` statement instead of inserting them all into body of parent node.
-        Because private variables of class or other external scope will be modified.
-        For example, `self.var_dict["key"]`. In this case, nested structure of newly
-        defined functions is easier to understand.
-        """
-        if not self.new_func_nodes:
-            return
-        idx = -1
-        if isinstance(node, list):
-            idx = len(node) - 1
-        elif isinstance(node, gast.AST):
-            for _, child in gast.iter_fields(node):
-                self._insert_func_nodes(child)
-        while idx >= 0:
-            child_node = node[idx]
-            if child_node in self.new_func_nodes:
-                node[idx:idx] = self.new_func_nodes[child_node]
-                idx = idx + len(self.new_func_nodes[child_node]) - 1
-                del self.new_func_nodes[child_node]
-            else:
-                self._insert_func_nodes(child_node)
-                idx = idx - 1
-
-    def get_new_func_nodes(self):
-        return self.new_func_nodes
-
-
-def is_candidate_node(node):
-    """
-    Nodes with specified type will be dependent on tensor.
-    """
-    return isinstance(node, (gast.Compare, gast.BoolOp, gast.UnaryOp))
-
-
-def compare_with_none(node):
-    """
-    Whether the comparator of `gast.Compare` node is `None`.
-    """
-    if isinstance(node, gast.Compare):
-        for child in [node.left, node.comparators]:
-            # node.comparators is a list.
-            if isinstance(child, list):
-                child = child[0]
-            if (isinstance(child, gast.Constant) and child.value is None) or (
-                    isinstance(child, gast.Name) and child.id == 'None'):
-                return True
-    return False
-
-
-class IsControlFlowVisitor(gast.NodeVisitor):
-    """
-    Judge whether the node.test from Dygraph code dependent on paddle Tensor.
-    If does, it should satisfy:
-        1. must involve at least one var whose type is Tensor.
-        2. the Tensor var should call `.numpy()[]` interface or Tensor.shape is [1].
-        3. involve Tensor.shape[i] and the shape[i] is unknown in compile time.
-    The following examples should not be considered as control_flow_if:
-        1. `if Tensor_var` or `if Tensor_var is None`
-        2. if Tensor.shape[i] is determined with fixed value (not -1 or None)
-
-    Note: pred in ConditionalBlock require variable, which means all vars should be Tensor
-          or transformed into Tensor, like fill_constant(shape=[1], dtype='int32', value=Tensor.shape[i]).
-
-    TODO: 1. need to deal with `tensor.shape[i]` which need to eval the data of shape[i],
-             because reshape_op may be called before this statement.
-    """
-
-    def __init__(self,
-                 ast_node,
-                 static_analysis_visitor=None,
-                 node_var_type_map=None):
-        assert isinstance(
-            ast_node, gast.AST
-        ), "Type of input node should be gast.AST, but received %s." % type(
-            ast_node)
-        self.ast_root = ast_node
-        if static_analysis_visitor is None:
-            static_analysis_visitor = StaticAnalysisVisitor(ast_node)
-        self.static_analysis_visitor = static_analysis_visitor
-        self.node_var_type_map = node_var_type_map
-
-        self.is_control_flow_num = 0
-        self._compare_node_tenor_set = set()
-
-    def transform(self):
-        node = self.ast_root
-        if is_candidate_node(node):
-            self.visit(node)
-        return self.is_control_flow_num > 0
-
-    def visit_BoolOp(self, node):
-        for i, child in enumerate(node.values):
-            if is_candidate_node(child):
-                self.visit(child)
-        return node
-
-    def visit_Compare(self, node):
-        # Ignores child node with `if x` or `if x is None`
-        # TODO(Aurelius84): `if tensor` will be supported in dygraph
-        # and should be considered as is_control_flow.
-        pre_control_flow_num = self.is_control_flow_num
-        if not compare_with_none(node):
-            self.generic_visit(node)
-            for child in gast.walk(node):
-                if isinstance(child, gast.Subscript):
-                    self._visit_Subscript(child)
-        if self.is_control_flow_num > pre_control_flow_num:
-            self._compare_node_tenor_set.add(node)
-        return node
-
-    def _visit_Subscript(self, node):
         self.generic_visit(node)
-        if hasattr(node, 'value') and isinstance(node.value, gast.Call):
-            self._visit_Call(node.value)
         return node
 
-    def _visit_Call(self, node):
-        assert isinstance(node, gast.Call)
-        if isinstance(node.func, gast.Attribute):
-            attr_node = node.func
-            if attr_node.attr == 'numpy':
-                self.is_control_flow_num += 1
+    def visit_IfExp(self, node):
+        """
+        Transformation with `true_fn(x) if Tensor > 0 else false_fn(x)`
+        """
+        if_condition_visitor = IfConditionVisitor(node.test,
+                                                  self.static_analysis_visitor)
+        need_transform = if_condition_visitor.is_control_flow()
+        self.generic_visit(node)
+        if need_transform:
+            pred_node, new_assign_nodes = if_condition_visitor.transform()
 
-    def visit_Call(self, node):
-        if is_paddle_api(node):
-            self.is_control_flow_num += 1
-        return node
+            if len(new_assign_nodes) > 0:
+                pred_node = merge_multi_assign_nodes(new_assign_nodes)
+
+            new_node = create_cond_node(None, pred_node, node.body, node.orelse,
+                                        True)
+            # Note: A blank line will be added separately if transform gast.Expr
+            # into source code. Using gast.Expr.value instead to avoid syntax error
+            # in python.
+            if isinstance(new_node, gast.Expr):
+                new_node = new_node.value
+
+            return new_node
+        else:
+            return node
+
+
+def merge_multi_assign_nodes(assign_nodes):
+    """
+     Merges multiple separate assign statements into a single node.
+    """
+    if not isinstance(assign_nodes, (list, tuple)):
+        assign_nodes = [assign_nodes]
+
+    return MergeAssignTransformer().transform(assign_nodes)
+
+
+class MergeAssignTransformer(gast.NodeTransformer):
+    """
+    Merges multiple separate assign statements into a single node.
+    Because it cannot be determined the insertion location of new nodes for `IfExpr`,
+    so replaces original node with merges conditional node.
+
+    Note: This is a very low level api and only used for IfExpr transformation
+          in control flow.
+
+    For example:
+        IfExpr:
+            y = x+1 if mean or x > 0 else x-1
+
+        assign nodes:
+            bool_tensor_1 = fluid.layers.cast(x=mean, dtype='bool')
+            logic_or_0 = fluid.layers.logical_or(x=bool_tensor_1, y=x > 0)
+
+        merged node:
+            fluid.layers.logical_or(x=fluid.layers.cast(x=mean, dtype='bool'), y=x > 0)
+    """
+
+    def __init__(self):
+        self._name_to_nodes_value = {}
+
+    def transform(self, nodes):
+        value = None
+        for node in nodes:
+            assert isinstance(node, gast.Assign)
+            # Note: targets of created assign node in control flow `if`
+            # only contains one element.
+            assert isinstance(node.targets[0], gast.Name)
+            target_name = node.targets[0].id
+            value = self.visit(node.value)
+            self._name_to_nodes_value[target_name] = value
+
+        return value
 
     def visit_Name(self, node):
-        if self._is_node_with_tensor(node, node.id):
-            self.is_control_flow_num += 1
+        if node.id in self._name_to_nodes_value:
+            node = self._name_to_nodes_value[node.id]
         return node
-
-    def visit_Constant(self, node):
-        if self._is_node_with_tensor(node, node.value):
-            self.is_control_flow_num += 1
-        return node
-
-    def _is_node_with_tensor(self, node, name_id):
-        tensor_types = set(
-            [NodeVarType.TENSOR, NodeVarType.PADDLE_RETURN_TYPES])
-        # Look up the node_var_type_map by name_id.
-        if self.node_var_type_map:
-            if name_id and isinstance(name_id, six.string_types):
-                var_type = self.node_var_type_map.get(name_id, None)
-                if var_type and var_type & tensor_types:
-                    return True
-        # if not found, look up the node_to_wrapper_map by node.
-        node_to_wrapper_map = self.static_analysis_visitor.get_node_to_wrapper_map(
-        )
-        wrapper_node = node_to_wrapper_map.get(node, None)
-        if wrapper_node is not None:
-            if wrapper_node.node_var_type & tensor_types:
-                return True
-
-        return False
-
-    def get_compare_nodes_with_tensor(self):
-        return self._compare_node_tenor_set
 
 
 class NodeTestTransformer(gast.NodeTransformer):
-    def __init__(self, ast_node, compare_nodes_with_tensor=set()):
+    def __init__(self,
+                 ast_node,
+                 compare_nodes_with_tensor=None,
+                 node_to_wrapper_map=None):
+        if compare_nodes_with_tensor is None:
+            compare_nodes_with_tensor = set()
         self.ast_root = ast_node
         self._compare_nodes_with_tensor = compare_nodes_with_tensor
+        if node_to_wrapper_map is None:
+            node_to_wrapper_map = {}
+        self.node_to_wrapper_map = node_to_wrapper_map
         self._new_assign_nodes = []
 
     def transform(self):
-        return self.visit(self.ast_root)
+        node = self.ast_root
+        if not is_candidate_node(node):
+            return self._create_cast_node(node)
+        return self.visit(node)
+
+    def visit_Call(self, node):
+        # Remove `numpy()` statement, like `Tensor.numpy()[i]` -> `Tensor[i]`
+        if isinstance(node.func, gast.Attribute):
+            attribute = node.func
+            if attribute.attr == 'numpy':
+                node = attribute.value
+        self.generic_visit(node)
+        return node
 
     def visit_UnaryOp(self, node):
         self.generic_visit(node)
@@ -287,8 +216,11 @@ class NodeTestTransformer(gast.NodeTransformer):
     def visit_BoolOp(self, node):
         for i, child in enumerate(node.values):
             if not is_candidate_node(child):
-                node.values[i] = self._create_bool_node(child)
-                continue
+                node_wrapper = self.node_to_wrapper_map.get(child, None)
+                if node_wrapper and node_wrapper.node_var_type & NodeVarType.TENSOR_TYPES:
+                    node.values[i] = self._create_cast_node(child)
+                else:
+                    node.values[i] = self._create_bool_node(child)
         self.generic_visit(node)
         new_node = self._create_logic_node(node)
         return new_node
@@ -297,12 +229,22 @@ class NodeTestTransformer(gast.NodeTransformer):
         if compare_with_none(
                 node) or node not in self._compare_nodes_with_tensor:
             return self._create_bool_node(node)
+        self.generic_visit(node)
         return node
 
+    def _create_cast_node(self, node):
+        template = "fluid.layers.cast(x={}, dtype='bool')"
+
+        return self._create_node_with_api_template(node, template)
+
     def _create_bool_node(self, node):
+        template = "fluid.layers.fill_constant(shape=[1], dtype='bool', value=bool({}))"
+
+        return self._create_node_with_api_template(node, template)
+
+    def _create_node_with_api_template(self, node, template):
         node_code = ast_to_source_code(node)
-        new_node_str = "fluid.layers.fill_constant(shape=[1], dtype='bool', value=bool({}))".format(
-            node_code)
+        new_node_str = template.format(node_code)
         # gast.parse return Module(body=[expr(value=...)])
         new_node = gast.parse(new_node_str).body[0].value
         bool_tensor_name = unique_name.generate(PLAIN_TENSOR_PREFIX)
@@ -362,7 +304,8 @@ class IfConditionVisitor(object):
         self.static_analysis_visitor = static_analysis_visitor
         self.visitor = IsControlFlowVisitor(node, static_analysis_visitor,
                                             node_var_type_map)
-        self.transformer = NodeTestTransformer(node)
+        self.transformer = NodeTestTransformer(
+            node, node_to_wrapper_map=self.visitor.node_to_wrapper_map)
         self.compare_nodes_with_tensor = set()
         self._is_control_flow_if = False
 
@@ -461,6 +404,8 @@ class NameVisitor(gast.NodeVisitor):
             self.generic_visit(node)
 
     def visit_Name(self, node):
+        blacklist = {'True', 'False', 'None'}
+        if node.id in blacklist: return
         if not self._is_call_func_name_node(node):
             if isinstance(node.ctx, self._candidate_ctxs):
                 self.name_ids[node.id].append(node.ctx)
@@ -482,10 +427,6 @@ class NameVisitor(gast.NodeVisitor):
                 self._update_name_ids(before_name_ids)
             else:
                 self.name_ids = before_name_ids
-
-    def visit_Return(self, node):
-        # Ignore the vars in return
-        return
 
     def _visit_child(self, node):
         self.name_ids = defaultdict(list)
@@ -569,25 +510,63 @@ def parse_cond_args(var_ids_dict, return_ids=None, ctx=gast.Load):
     return arguments
 
 
-def parse_cond_return(parent_vars_dict, if_vars_dict, else_vars_dict):
+def parse_cond_return(parent_vars_dict, if_vars_dict, else_vars_dict,
+                      after_ifelse_vars_dict):
     """
     Find out the ast.Name list of output by analyzing node's AST information.
-    Following conditions should be satisfied while determining whether a variable is a return value:
-    1. the var in parent scope is modified in if/else node.
-    2. new var is both created in if and else node.
+    One of the following conditions should be satisfied while determining whether a variable is a return value:
+    1. the var in parent scope is modified in If.body or If.orelse node.
+    2. new var is both created in If.body and If.orelse node.
+    3. new var is created only in one of If.body or If.orelse node, and it used as gast.Load firstly after gast.If node.
 
-    If different var is modified in if and else node, it should add the var in return_ids
-    of different node.
     For example:
-            x, y = 5, 10
-            if x > 4:
-                x = x+1
-                z = x*x
-            else:
-                y = y - 1
-                z = y*y
+        x, y = 5, 10
+        if x > 4:
+            x = x+1
+            z = x*x
+            q = 10
+        else:
+            y = y - 1
+            z = y*y
+            m = 20
+            n = 20
 
-    The return_ids should be (x, y, z) for `if` and `else`node.
+        print(q)
+        n = 30
+        print(n)
+
+
+    The return_ids are (x, y, z, q) for `If.body` and `If.orelse`node, because
+    1. x is modified in If.body node,
+    2. y is modified in If.body node,
+    3. z is both created in If.body and If.orelse node,
+    4. q is created only in If.body, and it is used by `print(q)` as gast.Load.
+    Note:
+        After transformed, q and z are created in parent scope. For example,
+
+        x, y = 5, 10
+        q = fluid.dygraph.dygraph_to_static.variable_trans_func.data_layer_not_check(name='q', shape=[-1], dtype='float32')
+        z = fluid.dygraph.dygraph_to_static.variable_trans_func.data_layer_not_check(name='z', shape=[-1], dtype='float32')
+
+        def true_func(x, y, q):
+            x = x+1
+            z = x*x
+            q = 10
+            return x,y,z,q
+
+        def false_func(x, y, q):
+            y = y - 1
+            z = y*y
+            m = 20
+            n = 20
+            return x,y,z,q
+
+        x,y,z,q = fluid.layers.cond(x>4, lambda: true_func(x, y), lambda: false_func(x, y, q))
+
+    m and n are not in return_ids, because
+    5. m is created only in If.orelse, but it is not used after gast.If node.
+    6. n is created only in If.orelse, and it is used by `n = 30` and `print(n)`, but it is not used as gast.Load firstly but gast.Store .
+
     """
 
     def _is_return_var(ctxs):
@@ -603,99 +582,151 @@ def parse_cond_return(parent_vars_dict, if_vars_dict, else_vars_dict):
                 vars.append(k)
         return vars
 
-    def _candidate_vars(child_dict, parent_dict):
+    def _modified_vars(child_dict, parent_dict):
         return set([
             var for var in _vars_with_store(child_dict) if var in parent_dict
         ])
 
-    # 1. the var in parent_ids is modified in if/else node.
-    if_candidate_vars = _candidate_vars(if_vars_dict, parent_vars_dict)
-    else_candidate_vars = _candidate_vars(else_vars_dict, parent_vars_dict)
+    def _vars_loaded_before_store(ids_dict):
+        new_dict = defaultdict(list)
+        for k, ctxs in ids_dict.items():
+            for ctx in ctxs:
+                if isinstance(ctx, gast.Load):
+                    new_dict[k].append(ctx)
+                elif isinstance(ctx, gast.Store):
+                    break
+        return new_dict
 
-    # 2. new var is both created in if and else node.
-    if_new_vars = set([
+    # modified vars
+    body_modified_vars = _modified_vars(if_vars_dict, parent_vars_dict)
+    orelse_modified_vars = _modified_vars(else_vars_dict, parent_vars_dict)
+    modified_vars = body_modified_vars | orelse_modified_vars
+
+    # new vars
+    body_new_vars = set([
         var for var in _vars_with_store(if_vars_dict)
         if var not in parent_vars_dict
     ])
-    else_new_vars = set([
+    orelse_new_vars = set([
         var for var in _vars_with_store(else_vars_dict)
         if var not in parent_vars_dict
     ])
-    new_vars = if_new_vars & else_new_vars
+    new_vars_in_body_or_orelse = body_new_vars | orelse_new_vars
+    new_vars_in_one_of_body_or_orelse = body_new_vars ^ orelse_new_vars
 
-    # generate return_ids of if/else node.
-    modified_vars = if_candidate_vars | else_candidate_vars
-    return_ids = list(modified_vars | new_vars)
+    # 1. the var in parent scope is modified in If.body or If.orelse node.
+    modified_vars_from_parent = modified_vars - new_vars_in_body_or_orelse
+
+    # 2. new var is both created in If.body and If.orelse node.
+    new_vars_in_body_and_orelse = body_new_vars & orelse_new_vars
+
+    # 3. new var is created only in one of If.body or If.orelse node, and it used as gast.Load firstly after gast.If node.
+    used_vars_after_ifelse = set(
+        [var for var in _vars_loaded_before_store(after_ifelse_vars_dict)])
+    new_vars_to_create = new_vars_in_one_of_body_or_orelse & used_vars_after_ifelse | new_vars_in_body_and_orelse
+
+    # 4. generate return_ids of if/else node.
+    return_ids = list(modified_vars_from_parent | new_vars_in_body_and_orelse |
+                      new_vars_to_create)
     return_ids.sort()
 
-    return return_ids, list(modified_vars - new_vars)
+    return return_ids, modified_vars_from_parent, new_vars_to_create
 
 
 def transform_if_else(node, root):
     """
     Transform ast.If into control flow statement of Paddle static graph.
     """
+    # TODO(liym27): Consider variable like `self.a` modified in if/else node.
     parent_name_ids = get_name_ids([root], end_node=node)
-    if_name_ids = get_name_ids(node.body)
-    else_name_ids = get_name_ids(node.orelse)
+    body_name_ids = get_name_ids(node.body)
+    orelse_name_ids = get_name_ids(node.orelse)
 
-    return_name_ids, modified_name_ids = parse_cond_return(
-        parent_name_ids, if_name_ids, else_name_ids)
+    # Get after_ifelse_name_ids, which means used var names after If.body and If.orelse node.
+    after_ifelse_name_ids = defaultdict(list)
+    all_name_ids = get_name_ids([root])
+    for name in all_name_ids:
+        before_var_names_ids = parent_name_ids.get(name, []) + \
+                           body_name_ids.get(name, []) + orelse_name_ids.get(name, [])
+        # Note: context of node.Name like gast.Load is a concrete object which has unique id different from other gast.Load
+        #  E.g. ctx of `x` can be [<gast.Load object at 0x142a33c90>, <gast.Load object at 0x142a51950>, <gast.Param object at 0x1407d8250>]
+        after_var_names_ids = [
+            ctx for ctx in all_name_ids[name] if ctx not in before_var_names_ids
+        ]
+        if after_var_names_ids:
+            after_ifelse_name_ids[name] = after_var_names_ids
+
+    return_name_ids, modified_name_ids_from_parent, new_vars_to_create = parse_cond_return(
+        parent_name_ids, body_name_ids, orelse_name_ids, after_ifelse_name_ids)
+
+    # NOTE: Python can create variable only in if body or only in else body, and use it out of if/else.
+    # E.g.
+    #
+    # if x > 5:
+    #   a = 10
+    # print(a)
+    #
+    # Create static variable for those variables
+    create_new_vars_in_parent_stmts = []
+    for name in new_vars_to_create:
+        # NOTE: Consider variable like `self.a` modified in if/else node.
+        if "." not in name:
+            create_new_vars_in_parent_stmts.append(
+                create_static_variable_gast_node(name))
+
+    modified_name_ids = modified_name_ids_from_parent | new_vars_to_create
 
     true_func_node = create_funcDef_node(
         node.body,
         name=unique_name.generate(TRUE_FUNC_PREFIX),
-        input_args=parse_cond_args(if_name_ids, modified_name_ids),
+        input_args=parse_cond_args(body_name_ids, modified_name_ids),
         return_name_ids=return_name_ids)
     false_func_node = create_funcDef_node(
         node.orelse,
         name=unique_name.generate(FALSE_FUNC_PREFIX),
-        input_args=parse_cond_args(else_name_ids, modified_name_ids),
+        input_args=parse_cond_args(orelse_name_ids, modified_name_ids),
         return_name_ids=return_name_ids)
 
-    return true_func_node, false_func_node, return_name_ids
+    return create_new_vars_in_parent_stmts, true_func_node, false_func_node, return_name_ids
 
 
-def create_cond_node(return_name_ids, pred, true_func, false_func):
+def create_cond_node(return_name_ids,
+                     pred,
+                     true_func,
+                     false_func,
+                     is_if_expr=False):
     """
     Create `fluid.layers.cond(pred, true_fn, false_fn)` to replace
     original `python if/else` statement.
     """
+
+    def create_lambda_node(func_or_expr_node, is_if_expr=False):
+        body = func_or_expr_node
+        if not is_if_expr:
+            body = gast.Call(
+                func=gast.Name(
+                    id=func_or_expr_node.name,
+                    ctx=gast.Load(),
+                    annotation=None,
+                    type_comment=None),
+                args=[func_or_expr_node.args],
+                keywords=[])
+
+        lambda_node = gast.Lambda(
+            args=gast.arguments(
+                args=[],
+                posonlyargs=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=None,
+                kwarg=None,
+                defaults=[]),
+            body=body)
+        return lambda_node
+
     cond_api = gast.parse('fluid.layers.cond').body[0].value
-    true_func_lambda = gast.Lambda(
-        args=gast.arguments(
-            args=[],
-            posonlyargs=[],
-            vararg=None,
-            kwonlyargs=[],
-            kw_defaults=None,
-            kwarg=None,
-            defaults=[]),
-        body=gast.Call(
-            func=gast.Name(
-                id=true_func.name,
-                ctx=gast.Load(),
-                annotation=None,
-                type_comment=None),
-            args=[true_func.args],
-            keywords=[]))
-    false_func_lambda = gast.Lambda(
-        args=gast.arguments(
-            args=[],
-            posonlyargs=[],
-            vararg=None,
-            kwonlyargs=[],
-            kw_defaults=None,
-            kwarg=None,
-            defaults=[]),
-        body=gast.Call(
-            func=gast.Name(
-                id=false_func.name,
-                ctx=gast.Load(),
-                annotation=None,
-                type_comment=None),
-            args=[false_func.args],
-            keywords=[]))
+    true_func_lambda = create_lambda_node(true_func, is_if_expr)
+    false_func_lambda = create_lambda_node(false_func, is_if_expr)
     cond_layer = gast.Call(
         func=cond_api,
         args=[pred, true_func_lambda, false_func_lambda],

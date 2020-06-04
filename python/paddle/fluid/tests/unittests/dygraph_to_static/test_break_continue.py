@@ -17,7 +17,7 @@ from __future__ import print_function
 import unittest
 import numpy as np
 import paddle.fluid as fluid
-from paddle.fluid.dygraph.jit import dygraph_to_static_graph
+from paddle.fluid.dygraph.jit import declarative
 
 SEED = 2020
 np.random.seed(SEED)
@@ -89,29 +89,44 @@ def test_break_in_while(x):
 
 def test_break_continue_in_for(x):
     x = fluid.dygraph.to_variable(x)
+
+    # TODO(liym27): Uncomment code after "if" statement can be transformed correctly.
+    # for i in range(1, 10, 1):
+    #     if i <= 4:
+    #         x += 1
+    #         continue
+    #     else:
+    #         x += 10010
+    #         break
+    #     x += 10086
+
+    a = fluid.layers.fill_constant(shape=[1], dtype='int32', value=0)
     for i in range(1, 10, 1):
-        if i <= 4:
+        if a <= 4:
             x += 1
+            a += 1
             continue
         else:
             x += 10010
             break
         x += 10086
+
     return x
 
 
 def test_for_in_else(x):
     x = fluid.dygraph.to_variable(x)
 
-    # Case 1:
-    if False:
-        pass
-    else:
-        for i in range(0, 10):
-            if i > 5:
-                x += 1
-                break
-            x += i
+    # TODO(liym27): Uncomment code after "if" statement can be transformed correctly.
+    # # Case 1:
+    # if False:
+    #     pass
+    # else:
+    #     for i in range(0, 10):
+    #         if i > 5:
+    #             x += 1
+    #             break
+    #         x += i
 
     # Case 2:
     if False:
@@ -122,6 +137,26 @@ def test_for_in_else(x):
             break
             x += i
     return x
+
+
+def while_loop_class_var(x):
+    class Foo(object):
+        def __init__(self):
+            self.a = 3
+            self.b = 4
+            self.c = 5
+
+    foo = Foo()
+    i = fluid.dygraph.to_variable(x)
+    while i < 10:
+        foo.b = fluid.layers.zeros(shape=[1], dtype='float32')
+        foo.c = foo.b + foo.a
+        i += 1
+        if foo.c < 0:
+            continue
+        if foo.c > 6:
+            break
+    return foo.c
 
 
 class TestContinueInFor(unittest.TestCase):
@@ -140,13 +175,9 @@ class TestContinueInFor(unittest.TestCase):
             return res.numpy()
 
     def run_static_mode(self):
-        main_program = fluid.Program()
-        with fluid.program_guard(main_program):
-            res = dygraph_to_static_graph(self.dygraph_func)(self.input)
-        exe = fluid.Executor(self.place)
-        static_res = exe.run(main_program, fetch_list=[res])
-
-        return static_res[0]
+        with fluid.dygraph.guard():
+            res = declarative(self.dygraph_func)(self.input)
+            return res.numpy()
 
     def test_transformed_static_result(self):
         static_res = self.run_static_mode()
@@ -186,24 +217,15 @@ class TestContinueInWhile(TestContinueInFor):
     def init_dygraph_func(self):
         self.dygraph_func = test_continue_in_while
 
-    def test_transformed_static_result(self):
-        # TODO: while i < 10 in dygraph will be supported after PR22892
-        # so currently we just assert static result.
-        # remove this overrided function after PR22892 is merged
-        static_res = self.run_static_mode()
-        self.assertEqual(15, static_res[0])
-
 
 class TestBreakInWhile(TestContinueInWhile):
     def init_dygraph_func(self):
         self.dygraph_func = test_break_in_while
 
-    def test_transformed_static_result(self):
-        # TODO: while i < 10 in dygraph will be supported after PR22892
-        # so currently we just assert static result.
-        # remove this overrided function after PR22892 is merged
-        static_res = self.run_static_mode()
-        self.assertEqual(15, static_res[0])
+
+class TestWhileLoopClassVar(TestContinueInWhile):
+    def init_dygraph_func(self):
+        self.dygraph_func = while_loop_class_var
 
 
 if __name__ == '__main__':

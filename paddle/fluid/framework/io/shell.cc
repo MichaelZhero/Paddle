@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "paddle/fluid/framework/io/shell.h"
+#include "paddle/fluid/platform/enforce.h"
+#include "paddle/fluid/platform/timer.h"
 
 namespace paddle {
 namespace framework {
@@ -27,14 +29,16 @@ std::shared_ptr<FILE> shell_fopen(const std::string& path,
   }
   FILE* fp;
   if (!(fp = fopen(path.c_str(), mode.c_str()))) {
-    LOG(FATAL) << "fopen fail, path[" << path << "], mode[" << mode << "]";
+    PADDLE_THROW(platform::errors::Unavailable(
+        "Failed to open file, path[%s], mode[%s].", path, mode));
   }
   return {fp, [path](FILE* fp) {
             if (shell_verbose()) {
               LOG(INFO) << "Closing file[" << path << "]";
             }
             if (0 != fclose(fp)) {
-              LOG(FATAL) << "fclose fail, path[" << path << "]";
+              PADDLE_THROW(platform::errors::Unavailable(
+                  "Failed to close file, path[%s].", path));
             }
           }};
 #endif
@@ -56,7 +60,7 @@ static int close_open_fds_internal() {
 
   int dir_fd = -1;
   if ((dir_fd = open("/proc/self/fd", O_RDONLY)) < 0) {
-    LOG(FATAL) << "proc/self/fd open fail";
+    PADDLE_THROW(platform::errors::Unavailable("Failed to open proc/self/fd."));
     return -1;
   }
   char buffer[sizeof(linux_dirent)];
@@ -66,7 +70,8 @@ static int close_open_fds_internal() {
     if ((bytes = syscall(SYS_getdents, dir_fd,
                          reinterpret_cast<linux_dirent*>(buffer),
                          sizeof(buffer))) < 0) {
-      LOG(FATAL) << "syscall fail";
+      PADDLE_THROW(platform::errors::Unavailable(
+          "System call failed via syscall function."));
       return -1;
     }
 
@@ -296,23 +301,48 @@ std::pair<std::shared_ptr<FILE>, std::shared_ptr<FILE>> shell_p2open(
 #endif
 }
 
-std::string shell_get_command_output(const std::string& cmd) {
+std::string shell_get_command_output(const std::string& cmd, int time_out,
+                                     int sleep_inter, bool print_cmd) {
 #if defined _WIN32 || defined __APPLE__
-  return "";
+  PADDLE_THROW(platform::errors::Unimplemented(
+      "This function(shell_get_command_output) is not implemented under _WIN32 "
+      "or __APPLE__."));
 #else
   int err_no = 0;
+  platform::Timer timer;
   do {
+    if (print_cmd) {
+      LOG(INFO) << "exec cmd:[" << cmd << "]";
+    }
     err_no = 0;
     std::shared_ptr<FILE> pipe = shell_popen(cmd, "r", &err_no);
     string::LineFileReader reader;
 
-    if (reader.getdelim(&*pipe, 0)) {
-      pipe = nullptr;
-      if (err_no == 0) {
+    char* buf = reader.getdelim(&*pipe, 0);
+    if (err_no == 0) {
+      if (buf) {
         return reader.get();
       }
+      return "";
     }
-  } while (err_no == -1);
+
+    if (sleep_inter > 0) {
+      usleep(sleep_inter);
+    }
+
+    timer.Pause();
+    if (time_out > 0 && timer.ElapsedMS() >= time_out) {
+      PADDLE_THROW(paddle::platform::errors::ExecutionTimeout(
+          "shell_get_command_output execute  error errno:%d and try until "
+          "timeout.",
+          errno));
+      return "";
+    }
+    timer.Resume();
+
+    pipe = nullptr;
+  } while (err_no);
+
   return "";
 #endif
 }

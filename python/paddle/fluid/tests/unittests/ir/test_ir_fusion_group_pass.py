@@ -109,11 +109,9 @@ class FusionGroupPassTest2(FusionGroupPassTest):
             tmp_2 = layers.relu(layers.sigmoid(self.feed_vars[3]))
             tmp_3 = layers.mul(tmp_1, tmp_2)
 
-        # TODO(wangchaochaohu): support the case when some vars are set
-        #  stop_gradient = True.
-
+        self.append_gradients(tmp_3)
         self.num_fused_ops = 2
-        self.fetch_list = [tmp_3]
+        self.fetch_list = [tmp_3, self.grad(tmp_1)]
 
 
 class FusionGroupPassTestFP64(FusionGroupPassTest):
@@ -124,7 +122,7 @@ class FusionGroupPassTestFP64(FusionGroupPassTest):
         self.fused_op_type = "fusion_group"
 
 
-class FusionGroupPassTestFP16(FusionGroupPassTest):
+class FusionGroupPassTestCastAndFP16(FusionGroupPassTest):
     def build_program(self, dtype):
         with fluid.program_guard(self.main_program, self.startup_program):
             self.feed_vars = self._prepare_feed_vars([32, 128], dtype, 2)
@@ -134,7 +132,7 @@ class FusionGroupPassTestFP16(FusionGroupPassTest):
 
             # subgraph with 2 op nodes
             tmp_0 = self.feed_vars[0] * self.feed_vars[1]
-            tmp_1 = layers.cast(tmp_0, dtype="float16")
+            tmp_1 = layers.softmax(layers.cast(tmp_0, dtype="float16"))
             tmp_2 = layers.mul(tmp_0, self.feed_vars[2])
             # subgraph with 4 op nodes
             tmp_3 = layers.cast(tmp_2, dtype="float16")
@@ -143,7 +141,7 @@ class FusionGroupPassTestFP16(FusionGroupPassTest):
 
         self.append_gradients(tmp_5)
 
-        self.num_fused_ops = 3
+        self.num_fused_ops = 4
         self.fetch_list = [tmp_5, self.grad(tmp_0)]
 
 
@@ -165,7 +163,7 @@ class FusionGroupPassSumTest(FusionGroupPassTest):
 
         self.append_gradients(tmp_3)
 
-        self.num_fused_ops = 3
+        self.num_fused_ops = 4
         self.fetch_list = [tmp_3, self.grad(tmp_0)]
 
 
@@ -175,7 +173,7 @@ class FusionGroupPassCastTest(FusionGroupPassTest):
             self.feed_vars = self._prepare_feed_vars([2, 2], dtype, 2)
 
             tmp_0 = layers.elementwise_add(self.feed_vars[0], self.feed_vars[1])
-            tmp_1 = layers.cast(tmp_0, dtype="double")
+            tmp_1 = layers.cast(tmp_0, dtype="float64")
             tmp_2 = layers.cast(tmp_1, dtype="float32")
 
         self.append_gradients(tmp_2)
@@ -185,6 +183,29 @@ class FusionGroupPassCastTest(FusionGroupPassTest):
 
     def setUp(self):
         self.build_program("float64")
+        self.feeds = self._feed_random_data(self.feed_vars)
+        self.pass_names = "fusion_group_pass"
+        self.fused_op_type = "fusion_group"
+
+
+class FusionGroupPassFillConstantTest(FusionGroupPassTest):
+    def build_program(self, dtype):
+        with fluid.program_guard(self.main_program, self.startup_program):
+            self.feed_vars = self._prepare_feed_vars([2, 2], dtype, 2)
+
+            tmp_0 = layers.elementwise_add(self.feed_vars[0], self.feed_vars[1])
+            tmp_1 = layers.fill_constant(shape=[2, 2], dtype=dtype, value=2.0)
+            tmp_2 = layers.scale(
+                tmp_1, scale=3.0, bias=1.0, bias_after_scale=True)
+            tmp_3 = layers.elementwise_mul(tmp_2, tmp_0)
+
+        self.append_gradients(tmp_3)
+
+        self.num_fused_ops = 1
+        self.fetch_list = [tmp_2, self.grad(tmp_0)]
+
+    def setUp(self):
+        self.build_program("float32")
         self.feeds = self._feed_random_data(self.feed_vars)
         self.pass_names = "fusion_group_pass"
         self.fused_op_type = "fusion_group"

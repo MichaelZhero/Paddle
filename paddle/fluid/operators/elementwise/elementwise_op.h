@@ -38,35 +38,40 @@ class ElementwiseOp : public framework::OperatorWithKernel {
   using Tensor = framework::Tensor;
 
   void InferShape(framework::InferShapeContext *ctx) const override {
-    PADDLE_ENFORCE_EQ(ctx->HasInput("X"), true,
-                      "Input(X) of elementwise op should not be null.");
-    PADDLE_ENFORCE_EQ(ctx->HasInput("Y"), true,
-                      "Input(Y) of elementwise op should not be null.");
-    PADDLE_ENFORCE_EQ(ctx->HasOutput("Out"), true,
-                      "Output(Out) of elementwise op should not be null.");
+    OP_INOUT_CHECK(ctx->HasInput("X"), "Input", "X", "ElementwiseOp");
+    OP_INOUT_CHECK(ctx->HasInput("Y"), "Input", "Y", "ElementwiseOp");
+    OP_INOUT_CHECK(ctx->HasOutput("Out"), "Output", "Out", "ElementwiseOp");
 
-    PADDLE_ENFORCE(
-        ctx->GetInputsVarType("Y").front() ==
-            framework::proto::VarType::LOD_TENSOR,
-        "The input var's type should be LoDTensor, but the received is %s [%s]",
-        ctx->GetInputsVarType("Y").front(), ctx->Inputs("Y").front());
+    PADDLE_ENFORCE_EQ(
+        ctx->GetInputsVarType("Y").front(),
+        framework::proto::VarType::LOD_TENSOR,
+        platform::errors::InvalidArgument(
+            "The input var's type should be LoDTensor, but the "
+            "received is %s [%s].",
+            ctx->GetInputsVarType("Y").front(), ctx->Inputs("Y").front()));
 
     if (ctx->GetInputsVarType("X").front() ==
         framework::proto::VarType::SELECTED_ROWS) {
       PADDLE_ENFORCE_EQ(
           ctx->GetInputDim("Y").size(), 1u,
-          "ShapeError: For elementwise_op, if X is Sparse(VarType.SELECTED_ROWS"
-          "), Y must be scalar. But reveived the dimension of Y = %s",
-          ctx->GetInputDim("Y").size());
+          platform::errors::InvalidArgument(
+              "For elementwise_op, if X is Sparse(VarType.SELECTED_ROWS"
+              "), Y must be scalar, the size of Y should be 1. "
+              "But reveived the size of Y = %s.",
+              ctx->GetInputDim("Y").size()));
       PADDLE_ENFORCE_EQ(
           ctx->GetInputDim("Y")[0], 1,
-          "ShapeError: For elementwise_op, if X is Sparse(VarType.SELECTED_ROWS"
-          "), Y must be scalar. But reveived the first dimension of Y = %s",
-          ctx->GetInputDim("Y")[0]);
+          platform::errors::InvalidArgument(
+              "For elementwise_op, if X is Sparse(VarType.SELECTED_ROWS"
+              "), Y must be scalar, the first dimension of Y should be 1. "
+              "But reveived the first dimension of Y = %s.",
+              ctx->GetInputDim("Y")[0]));
     } else if (ctx->GetInputsVarType("X").front() !=
                framework::proto::VarType::LOD_TENSOR) {
-      PADDLE_THROW("X's type[%s] is not supported by elementwise_op.",
-                   ctx->GetInputsVarType("X").front());
+      PADDLE_THROW(platform::errors::InvalidArgument(
+          "Input X's type[%s] is not supported by elementwise_op. Please set "
+          "its type to LOD_TENSOR.",
+          ctx->GetInputsVarType("X").front()));
     }
 
     if (ctx->GetInputDim("X") == ctx->GetInputDim("Y")) {
@@ -95,9 +100,11 @@ class ElementwiseOp : public framework::OperatorWithKernel {
     auto input_data_type = OperatorWithKernel::IndicateVarDataType(ctx, "X");
 
 #ifdef PADDLE_WITH_MKLDNN
-    // If broadcasting is needed, use native implementation
     auto CanMKLDNNElementwiseAddBeUsed = [&]() {
-      return ctx.Input<Tensor>("X")->dims() == ctx.Input<Tensor>("Y")->dims();
+      int axis = ctx.Attr<int>("axis");
+      int rankdiff = ctx.Input<Tensor>("X")->dims().size() -
+                     ctx.Input<Tensor>("Y")->dims().size();
+      return (rankdiff == 0) || (axis == -1) || (axis == rankdiff);
     };
 
     if (platform::CanMKLDNNBeUsed(ctx) &&
@@ -114,9 +121,10 @@ class ElementwiseOp : public framework::OperatorWithKernel {
 class ElementwiseOpInferVarType
     : public framework::PassInDtypeAndVarTypeToOutput {
  protected:
-  std::unordered_map<std::string, std::string> GetInputOutputWithSameType()
+  std::unordered_map<std::string, std::string> &GetInputOutputWithSameType()
       const override {
-    return std::unordered_map<std::string, std::string>{{"X", /*->*/ "Out"}};
+    static std::unordered_map<std::string, std::string> m{{"X", /*->*/ "Out"}};
+    return m;
   }
 };
 
@@ -212,9 +220,9 @@ class ElementwiseOpGrad : public framework::OperatorWithKernel {
 
   void InferShape(framework::InferShapeContext *ctx) const override {
     auto out_grad_name = framework::GradVarName("Out");
-    PADDLE_ENFORCE_EQ(ctx->HasInput("Y"), true, "Input(Y) should not be null.");
-    PADDLE_ENFORCE_EQ(ctx->HasInput(out_grad_name), true,
-                      "Input(Out@GRAD) should not be null.");
+    OP_INOUT_CHECK(ctx->HasInput("Y"), "Input", "Y", "ElementwiseOpGrad");
+    OP_INOUT_CHECK(ctx->HasInput(out_grad_name), "Input", out_grad_name,
+                   "ElementwiseOpGrad");
     auto x_grad_name = framework::GradVarName("X");
     auto y_grad_name = framework::GradVarName("Y");
     if (ctx->HasOutput(x_grad_name)) {
@@ -235,9 +243,7 @@ class ElementwiseOpGrad : public framework::OperatorWithKernel {
 #ifdef PADDLE_WITH_MKLDNN
     // If broadcasting is needed, use native implementation
     auto CanMKLDNNElementwiseAddGradBeUsed = [&]() {
-      auto dx = ctx.Output<Tensor>(framework::GradVarName("X"));
-      auto dy = ctx.Output<Tensor>(framework::GradVarName("Y"));
-      return (dx != nullptr && dy != nullptr && dx->dims() == dy->dims());
+      return (ctx.Input<Tensor>("X")->dims() == ctx.Input<Tensor>("Y")->dims());
     };
 
     if (platform::CanMKLDNNBeUsed(ctx) &&
@@ -306,12 +312,12 @@ class ElementwiseOpDoubleGradWithoutDXDY
       const framework::ExecutionContext &ctx) const override {
     framework::proto::VarType::Type input_data_type;
     if (ctx.HasInput("DDX") == false) {
-      PADDLE_ENFORCE_EQ(ctx.HasInput("DDY"), true,
-                        "Input(DDY) should not be null");
+      OP_INOUT_CHECK(ctx.HasInput("DDY"), "Input", "DDY",
+                     "ElementwiseOpDoubleGradWithoutDXDY");
       input_data_type = OperatorWithKernel::IndicateVarDataType(ctx, "DDY");
     } else if (ctx.HasInput("DDY") == false) {
-      PADDLE_ENFORCE_EQ(ctx.HasInput("DDX"), true,
-                        "Input(DDX) should not be null");
+      OP_INOUT_CHECK(ctx.HasInput("DDX"), "Input", "DDX",
+                     "ElementwiseOpDoubleGradWithoutDXDY");
       input_data_type = OperatorWithKernel::IndicateVarDataType(ctx, "DDX");
     } else {
       input_data_type = OperatorWithKernel::IndicateVarDataType(ctx, "DDX");
@@ -342,16 +348,16 @@ class ElemwiseGradKernel : public framework::OpKernel<T> {
   }
 };
 
-DECLARE_INPLACE_OP_INFERER(ElementwiseOpInplace, {"X", "Out"});
-DECLARE_INPLACE_OP_INFERER(ElementwiseGradOpInplace,
+DECLARE_INPLACE_OP_INFERER(ElementwiseOpInplaceInferer, {"X", "Out"});
+DECLARE_INPLACE_OP_INFERER(ElementwiseGradOpInplaceInferer,
                            {framework::GradVarName("Out"),
                             framework::GradVarName("X")});
-DECLARE_INPLACE_OP_INFERER(ElementwiseDoubleGradOpInplace, {"DDX", "DDOut"});
+DECLARE_INPLACE_OP_INFERER(ElementwiseDoubleGradOpInplaceInferer,
+                           {"DDX", "DDOut"});
 
-DECLARE_NO_NEED_BUFFER_VARS_INFERER(ElementwiseGradNoBufVarsInference, "X",
-                                    "Y");
-DECLARE_NO_NEED_BUFFER_VARS_INFERER(ElementwiseDoubleGradNoBufVarsInference,
-                                    "Y", "DOut");
+DECLARE_NO_NEED_BUFFER_VARS_INFERER(ElementwiseGradNoBufVarsInferer, "X", "Y");
+DECLARE_NO_NEED_BUFFER_VARS_INFERER(ElementwiseDoubleGradNoBufVarsInferer, "Y",
+                                    "DOut");
 
 }  // namespace operators
 }  // namespace paddle
@@ -383,4 +389,4 @@ DECLARE_NO_NEED_BUFFER_VARS_INFERER(ElementwiseDoubleGradNoBufVarsInference,
                     ::paddle::operators::ElementwiseOpInferVarType,     \
                     op_type##GradMaker<::paddle::framework::OpDesc>,    \
                     op_type##GradMaker<::paddle::imperative::OpBase>,   \
-                    ::paddle::operators::ElementwiseOpInplace);
+                    ::paddle::operators::ElementwiseOpInplaceInferer);

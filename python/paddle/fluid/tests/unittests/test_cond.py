@@ -502,7 +502,6 @@ class TestCondBackward(unittest.TestCase):
 
     def test_nested_cond_backward(self):
         def branch(i, img, label, mod_two):
-
             if mod_two:
                 predicate = ((i % 2) == 0)
             else:
@@ -521,6 +520,29 @@ class TestCondBackward(unittest.TestCase):
             self.add_optimizer_helper(cond_func,
                                       core.is_compiled_with_cuda(),
                                       use_parallel_exe)
+
+
+class TestCondWithError(unittest.TestCase):
+    def test_input_type_error(self):
+        main_program = framework.Program()
+        startup_program = framework.Program()
+        with framework.program_guard(main_program, startup_program):
+            pred = fluid.data(name='y', shape=[1], dtype='bool')
+
+            def func():
+                return pred
+
+            with self.assertRaises(TypeError):
+                layers.cond(None, func, func)
+
+            with self.assertRaises(TypeError):
+                layers.cond(pred, func, set())
+
+            with self.assertRaises(TypeError):
+                layers.cond(pred, set(), func)
+
+            with self.assertRaises(TypeError):
+                layers.cond(pred, func, func, set())
 
 
 if __name__ == '__main__':
